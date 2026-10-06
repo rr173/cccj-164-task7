@@ -10,9 +10,16 @@
   GET  /term/{token}/state        带任期地址：锁定截面（演练发放）
   GET  /term/{token}/commands     带任期地址：锁定时的命令结果
 
+以上 /api/state|plans|commands|commands/{id} 支持水位等待参数：
+  ?min_watermark=N&max_wait_ms=M&request_id=R
+  当前连续水位未达 N 时挂起等待（最长 M 毫秒），达标返回满足条件的同一
+  原子截面；超时返回 504 + 当前权威水位 + 重试信息；同一 request_id
+  再次请求返回原结果。
+
 运维 / 演练接口：
 
   GET  /ops/status                复制进度、延迟、隔离、当前演练
+  GET  /ops/waits                 水位等待请求（等待中的最低水位/剩余时间/最终结果）
   GET  /ops/quarantine            隔离记录（含已消除）
   GET  /ops/audit                 全量一致性审计
   GET  /ops/audit-tail            审计轨迹尾部
@@ -30,7 +37,7 @@ from __future__ import annotations
 import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from .replicator import ReplicatorError
 
@@ -71,29 +78,68 @@ class ReplicaHandler(BaseHTTPRequestHandler):
             "error": exc.reason, "message": str(exc), "details": exc.details,
         })
 
+    def _wait_query(self, query: dict, view: str, command_id: str | None = None):
+        """解析水位等待参数；未声明 min_watermark 时返回 None（普通读取）。
+
+        声明了 min_watermark 时返回 rep.await_watermark(...) 的
+        (status, body)：未达水位挂起等待，达标返回同一原子截面，
+        超时返回 504 + 权威水位，同一 request_id 幂等重放原结果。
+        """
+        if "min_watermark" not in query:
+            return None
+
+        def _one(name: str, default: str | None = None) -> str | None:
+            vals = query.get(name)
+            return vals[0] if vals else default
+
+        try:
+            min_watermark = int(_one("min_watermark") or "")
+        except ValueError:
+            raise ReplicatorError(
+                "BAD_WAIT_PARAMS", "min_watermark 必须是整数", status=400)
+        try:
+            max_wait_ms = int(_one("max_wait_ms", "0") or "0")
+        except ValueError:
+            raise ReplicatorError(
+                "BAD_WAIT_PARAMS", "max_wait_ms 必须是整数毫秒", status=400)
+        return self._rep().await_watermark(
+            view=view,
+            min_watermark=min_watermark,
+            max_wait_ms=max_wait_ms,
+            request_id=_one("request_id") or None,
+            command_id=command_id,
+        )
+
     # ------------------------------------------------------------------
     # 只读查询面
     # ------------------------------------------------------------------
 
     def do_GET(self) -> None:  # noqa: N802
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
+        query = parse_qs(parsed.query)
         rep = self._rep()
         try:
             if path == "/api/state":
+                waited = self._wait_query(query, "state")
+                if waited is not None:
+                    return self._json(*waited)
                 return self._json(200, rep.current_state())
             if path == "/api/plans":
-                state = rep.current_state()
-                return self._json(200, {
-                    "confirmed_index": state["replica"]["confirmed_index"],
-                    "plans": [
-                        {"id": pid, **pl}
-                        for pid, pl in sorted(rep.projection.plans.items())
-                    ],
-                })
+                waited = self._wait_query(query, "plans")
+                if waited is not None:
+                    return self._json(*waited)
+                return self._json(200, rep.plans_view())
             if path == "/api/commands":
+                waited = self._wait_query(query, "commands")
+                if waited is not None:
+                    return self._json(*waited)
                 return self._json(200, rep.commands_view())
             if path.startswith("/api/commands/"):
                 cid = path[len("/api/commands/"):].strip("/")
+                waited = self._wait_query(query, "command", command_id=cid)
+                if waited is not None:
+                    return self._json(*waited)
                 r = rep.receipt(cid)
                 if r is None:
                     return self._json(404, {"error": "NOT_FOUND",
@@ -117,6 +163,8 @@ class ReplicaHandler(BaseHTTPRequestHandler):
             # ---- 运维面 ----
             if path == "/ops/status":
                 return self._json(200, rep.status())
+            if path == "/ops/waits":
+                return self._json(200, rep.waits_view())
             if path == "/ops/quarantine":
                 return self._json(200, {"records": rep.store.list_quarantined(True)})
             if path == "/ops/audit":

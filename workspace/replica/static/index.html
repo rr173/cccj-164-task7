@@ -83,6 +83,29 @@
     <div id="term-result"></div>
   </div>
 
+  <!-- 水位等待 -->
+  <div class="card full">
+    <h2>只读水位等待（min_watermark / max_wait_ms / request_id）</h2>
+    <div class="row">
+      <select id="w-view">
+        <option value="state">state 截面</option>
+        <option value="plans">plans 草案</option>
+        <option value="commands">commands 命令结果</option>
+      </select>
+      <input id="w-min" type="number" placeholder="最低连续水位" style="width:120px" title="已确认分段数达到该值才返回">
+      <input id="w-wait" type="number" value="3000" style="width:100px" title="最长等待毫秒">
+      <span class="muted">ms</span>
+      <input id="w-rid" placeholder="request_id（可空，重试幂等）" style="width:200px">
+      <button onclick="startWait()">发起等待查询</button>
+      <span class="muted">未达水位时挂起等待；超时返回权威水位，绝不伪装旧数据</span>
+    </div>
+    <pre id="w-result" class="muted">尚未发起等待查询</pre>
+    <table id="waits-table" style="margin-top:10px"><thead><tr>
+      <th>request_id</th><th>视图</th><th class="num">最低水位</th><th>状态</th>
+      <th>剩余时间</th><th>最终结果</th><th>时间</th>
+    </tr></thead><tbody></tbody></table>
+  </div>
+
   <!-- 隔离 -->
   <div class="card full">
     <h2>隔离记录（不污染最近可用截面）</h2>
@@ -200,6 +223,9 @@ async function loadStatus() {
       <span class="${r.lag_over_limit?'bad':''}">${r.lag_segments} 段 / ${r.lag_events} 事件</span>
       <span class="muted">（上限 ${r.max_lag_segments} 段）</span></div>
     <div class="k">最后拉取</div><div class="v">${fmt(r.last_pull_at)}</div>
+    <div class="k">等待中的水位读</div><div class="v">${r.waiting_reads
+      ? '<span class="warn">' + r.waiting_reads + ' 个等待中</span>'
+      : '<span class="muted">无</span>'}</div>
     <div class="k">最后错误</div><div class="v">${r.last_error ? '<span class="bad">'+esc(r.last_error)+'</span>' : '—'}</div>`;
 
   // 隔离表
@@ -294,6 +320,51 @@ async function loadPlansAndCommands() {
       <td class="num">${c.result.event_count ?? ''}</td></tr>`).join('');
 }
 
+async function loadWaits() {
+  const {waits} = await api('/ops/waits');
+  $('waits-table').querySelector('tbody').innerHTML = waits.length === 0
+    ? '<tr><td colspan="7" class="muted">暂无水位等待请求</td></tr>'
+    : waits.map(w => `<tr>
+      <td title="${esc(w.request_id)}">${esc(short(w.request_id, 20))}</td>
+      <td>${w.view}${w.command_id ? '/' + esc(short(w.command_id, 10)) : ''}</td>
+      <td class="num">${w.min_watermark}</td>
+      <td>${w.state === 'WAITING' ? pill('等待中', 'warn')
+          : w.state === 'SATISFIED' ? pill('已满足', 'ok') : pill('超时', 'bad')}</td>
+      <td>${w.state === 'WAITING' ? (w.remaining_ms / 1000).toFixed(1) + 's' : '—'}</td>
+      <td>${w.state === 'SATISFIED'
+          ? `满足于水位 ${w.final_watermark}（耗时 ${w.wait?.waited_ms ?? 0}ms）`
+          : w.state === 'TIMEOUT'
+          ? `<span class="bad">超时</span>·权威水位 ${w.final_watermark}`
+          : '—'}</td>
+      <td>${fmt(w.finished_at || w.deadline)}</td>
+    </tr>`).join('');
+}
+
+async function startWait() {
+  const view = $('w-view').value;
+  const params = new URLSearchParams();
+  if ($('w-min').value !== '') params.set('min_watermark', $('w-min').value);
+  params.set('max_wait_ms', $('w-wait').value || '0');
+  if ($('w-rid').value) params.set('request_id', $('w-rid').value);
+  $('w-result').textContent =
+    `等待中…（最低连续水位 ${$('w-min').value || 0}，最长 ${$('w-wait').value || 0}ms）`;
+  try {
+    const r = await fetch(`/api/${view}?${params}`);
+    const data = await r.json();
+    $('w-result').textContent = JSON.stringify({
+      http_status: r.status,
+      wait: data.wait,
+      authoritative_watermark: data.authoritative_watermark,
+      retry: data.retry,
+      confirmed_index: data.replica ? data.replica.confirmed_index : data.confirmed_index,
+      state_digest: data.replica ? data.replica.state_digest : undefined,
+    }, null, 2);
+  } catch (e) {
+    $('w-result').textContent = '请求失败: ' + e.message;
+  }
+  await loadWaits();
+}
+
 async function loadDrills() {
   const {drills} = await api('/ops/drills');
   $('drills-table').querySelector('tbody').innerHTML = drills.length === 0
@@ -354,7 +425,7 @@ async function runAudit() {
 
 async function loadAll() {
   try {
-    await Promise.all([loadStatus(), loadSurface(), loadPlansAndCommands(), loadDrills()]);
+    await Promise.all([loadStatus(), loadSurface(), loadPlansAndCommands(), loadDrills(), loadWaits()]);
     await loadAuditTail();
   } catch (e) { /* 页面保持上次数据 */ }
   $('h-clock').textContent = new Date().toLocaleTimeString('zh-CN', {hour12:false});

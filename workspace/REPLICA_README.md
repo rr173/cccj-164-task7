@@ -10,7 +10,9 @@
 - **原子截面**：分段在投影副本上通过全部校验后，才与确认边界在同一 SQLite
   事务提交并原子替换内存投影。任何时刻查询只看到**完整确认边界**；
 - **幂等重放**：已确认序号的分段重复拉取正文一致即忽略；重启从最后确认边界恢复；
-- **只暴露密封截面**：主站尾部未密封事件不会下发，杜绝“事件进一半”的截面。
+- **只暴露密封截面**：主站尾部未密封事件不会下发，杜绝“事件进一半”的截面；
+- **水位等待读**：只读调用方可声明最低连续水位与最长等待时间，未达水位
+  挂起等待、达标返回同一原子截面、超时返回权威水位，同一请求标识幂等重放。
 
 ```
 主站 quota.http_server                 灾备 replica（只读）
@@ -44,7 +46,7 @@ open http://localhost:8899/
 bash demo_replica.sh
 ```
 
-测试：主站 220 项 + 灾备 32 项端到端（真实 HTTP 双进程 + 真实持久化）：
+测试：主站 220 项 + 灾备 44 项端到端（真实 HTTP 双进程 + 真实持久化）：
 
 ```bash
 python3 test_service.py
@@ -178,16 +180,52 @@ CAS（`meta.epoch` 必须仍等于本实例持有的纪元、且边界恰好停�
 磁盘重算值与查询结果不同」的窗口被彻底关闭：磁盘重算值始终等于查询
 截面（`replay_equivalence`）。
 
+## 只读水位等待（min_watermark / max_wait_ms / request_id）
+
+只读调用方可以在**状态、草案、命令结果**查询上声明**最低连续水位**与
+**最长等待时间**：
+
+```
+GET /api/state?min_watermark=5&max_wait_ms=3000&request_id=read-42
+GET /api/plans?min_watermark=5&max_wait_ms=3000
+GET /api/commands?min_watermark=5&max_wait_ms=3000
+GET /api/commands/{command_id}?min_watermark=5&max_wait_ms=3000
+```
+
+- **连续水位** = 已确认分段数（`confirmed_index`，序号必须恰好 `1..N` 无缺口）；
+- 当前接管实例尚未复制到该水位时，请求**挂起等待**；水位真正达标后返回
+  **满足条件的同一原子截面**（响应内 `wait.satisfied_watermark` 与截面水位
+  自洽，截面摘要 == 磁盘重放到该水位的重算值）；
+- **超时**返回 `504 WAIT_TIMEOUT`：当前**权威水位**（`authoritative_watermark`）
+  与可再次请求的信息（`retry`），**不含任何截面内容**——绝不把较旧数据
+  伪装成满足条件；
+- **跟随权威存储恢复**：等待期间发生接管（新纪元推进共享存储）、缺口隔离
+  （水位停滞直到缺口补齐）、人工暂停（水位冻结直到恢复）或服务重启时，
+  等待记录持久化于 `wait_requests` 表并随之恢复——重启时立即对账
+  （停机期间达标的收口为 SATISFIED、截止已过的收口为 TIMEOUT），
+  在途等待断开后可用同一 `request_id` 继续，**只有连续水位真正达到
+  要求才成功**；
+- **幂等**：同一 `request_id` 再次请求返回**原结果**（同一截面摘要 /
+  同一超时水位，`wait.idempotent_replay=true`），不重新等待、不重新计算；
+  并发同标识请求由条件更新单赢家收口，全部收敛到同一原子截面；
+- **不阻塞复制**：等待者只睡在自己的 HTTP 线程上（条件变量 + 100ms
+  权威存储轮询切片），复制线程提交分段后 `notify_all` 即返回，绝不
+  等待任何等待者；
+- 运维页面展示**等待中的最低水位、剩余时间与最终结果**
+  （`GET /ops/waits`，列出前惰性对账，页面所见即权威存储真实状态）。
+
+`max_wait_ms` 上限 120000ms；缺省 `request_id` 时服务端生成并随响应返回。
+
 ## HTTP API
 
 只读查询面：
 
 | 方法/路径 | 说明 |
 |---|---|
-| `GET /api/state` | 最近确认截面（节点余额/租约/草案视图 + 截面摘要） |
-| `GET /api/plans` | 确认截面内容量草案 |
-| `GET /api/commands` | 已确认命令回执列表 |
-| `GET /api/commands/{command_id}` | 单条命令结果 |
+| `GET /api/state` | 最近确认截面（节点余额/租约/草案视图 + 截面摘要）；支持水位等待参数 |
+| `GET /api/plans` | 确认截面内容量草案；支持水位等待参数 |
+| `GET /api/commands` | 已确认命令回执列表；支持水位等待参数 |
+| `GET /api/commands/{command_id}` | 单条命令结果；支持水位等待参数 |
 | `GET /api/segments` | 已确认分段（序号/seq/摘要） |
 | `GET /term/{token}/state` | 任期：锁定截面 |
 | `GET /term/{token}/commands` | 任期：锁定时命令结果 |
@@ -197,7 +235,8 @@ CAS（`meta.epoch` 必须仍等于本实例持有的纪元、且边界恰好停�
 
 | 方法/路径 | 说明 |
 |---|---|
-| `GET /ops/status` | 进度、主站 tip、延迟、是否落后超限、冻结演练、最后错误 |
+| `GET /ops/status` | 进度、主站 tip、延迟、是否落后超限、冻结演练、等待中读数、最后错误 |
+| `GET /ops/waits` | 水位等待请求（等待中的最低水位/剩余时间、已收口的最终结果） |
 | `GET /ops/quarantine` | 隔离记录（含原因、来源、是否已消除） |
 | `GET /ops/audit` | 在线全量一致性审计 |
 | `GET /ops/audit-tail` | 审计轨迹尾部 |
@@ -233,7 +272,8 @@ python3 -m replica audit-tail --db ./dr/replica.db --kind segment_quarantined
 | `segments` | 已确认分段原文（序号主键、digest 唯一）及确认它的接管纪元 —— 崩溃恢复的事实来源 |
 | `quarantined` | 被拒/隔离记录、原因码、来源、检测/消除时间 |
 | `drills` | 演练状态机、任期 token/到期时间、锁定摘要、冻结截面、报告 |
-| `audit_log` | 只追加审计轨迹（启动、分段确认、隔离、演练全生命周期等） |
+| `wait_requests` | 只读水位等待：视图/最低水位/截止时间/终态与原结果 —— 跨接管与重启跟随权威存储恢复，同一 request_id 幂等重放 |
+| `audit_log` | 只追加审计轨迹（启动、分段确认、隔离、演练全生命周期、等待收口等） |
 
 ## 代码结构
 
@@ -243,8 +283,8 @@ python3 -m replica audit-tail --db ./dr/replica.db --kind segment_quarantined
 | `quota/http_server.py` | 挂载 `/replica/*` 路由与 CLI 参数（仅新增，未改既有行为） |
 | `replica/verifier.py` | 纯函数校验：信封/双哈希链/投影守恒/命令结果/全量重放 |
 | `replica/store.py` | SQLite 持久化：边界与分段同事务原子提交 |
-| `replica/replicator.py` | 拉取循环、分段准入、原子截面、演练状态机、任期围栏 |
-| `replica/http_server.py` | 只读查询面、任期地址、运维/演练接口、测试注入口 |
+| `replica/replicator.py` | 拉取循环、分段准入、原子截面、演练状态机、任期围栏、只读水位等待 |
+| `replica/http_server.py` | 只读查询面（含水位等待参数）、任期地址、运维/演练接口、测试注入口 |
 | `replica/__main__.py` | `serve` / `audit` / `audit-tail` 命令行 |
-| `replica/static/index.html` | 运维页面（进度/延迟/隔离/截面/演练/审计） |
-| `test_replica.py` | 32 项端到端测试（含到期主动收口、并发收口、重启恢复、异常批次不跳过与滚动升级写入所有权围栏） |
+| `replica/static/index.html` | 运维页面（进度/延迟/水位等待/隔离/截面/演练/审计） |
+| `test_replica.py` | 44 项端到端测试（含到期主动收口、并发收口、重启恢复、异常批次不跳过、滚动升级写入所有权围栏与只读水位等待） |

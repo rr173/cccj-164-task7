@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import threading
 import time
@@ -47,6 +48,12 @@ TERM_EXPIRED = "TERM_EXPIRED"
 PROCESS_RESTART = "PROCESS_RESTART"
 BODY_CONFLICT = "BODY_CONFLICT"
 OWNERSHIP_LOST = "OWNERSHIP_LOST"
+# 只读水位等待
+WAIT_TIMEOUT = "WAIT_TIMEOUT"
+BAD_WAIT_PARAMS = "BAD_WAIT_PARAMS"
+REPLICA_SHUTDOWN = "REPLICA_SHUTDOWN"
+MAX_WAIT_MS = 120_000          # 单次等待上限（毫秒）
+WAIT_SLICE_SECONDS = 0.1       # 等待切片：跨进程接管推进的水位最迟 100ms 可见
 
 
 class ReplicatorError(Exception):
@@ -100,12 +107,24 @@ class Replicator:
         # 滞后隔离做状态化记录，避免同一轮落后反复刷审计
         self._lag_quarantined = False
 
+        # 只读水位等待：等待者只睡在这个条件变量上（HTTP 线程），复制线程
+        # 提交/重建后 notify_all 唤醒；等待者按 100ms 切片轮询权威存储，
+        # 因此跨进程接管推进的水位也能及时可见。复制线程绝不等待等待者。
+        self._wait_cond = threading.Condition()
+        # 进程级停机信号：只有 shutdown() 置位。失主降格（_stop）不影响
+        # 读等待——失主实例的只读查询本就跟随权威存储，等待也继续跟随。
+        self._shutdown = threading.Event()
+
         # 启动恢复：
         # - 验证中的演练因进程重启无法保证冻结语义 → 作废；
         # - 已发任期若截止时刻在停机期间到达 → 立即收口（不等 sweeper 首个
         #   tick，避免重启后仍有一段“已过期却冻结”的窗口）；
         # - 修复终态行/收口审计因崩溃留下的半截不一致。
         self._recover_drills_on_startup()
+        # 遗留的水位等待同样跟随权威存储对账：停机期间被接替实例推进到
+        # 达标的 → SATISFIED；截止时刻已过的 → TIMEOUT；其余保持 WAITING，
+        # 同一 request_id 再次请求时继续等待原截止时间。
+        self._recover_waits_on_startup()
 
         self._stop = threading.Event()
         self.thread = threading.Thread(target=self._poll_loop, name="replica-poller", daemon=True)
@@ -130,7 +149,9 @@ class Replicator:
         self.sweeper.start()
 
     def shutdown(self) -> None:
+        self._shutdown.set()
         self._stop.set()
+        self._signal_waits()  # 唤醒在途等待者尽快退出（记录保持 WAITING 可恢复）
 
     def _rebuild_from_authoritative(self) -> None:
         """从存储中的权威水位完整重建内存状态。
@@ -142,6 +163,12 @@ class Replicator:
         self.segments = self.store.load_segments()
         self.projection = verifier.replay_all(self.segments)
         self._published_digest = verifier.state_digest(self.projection)
+        self._signal_waits()  # 水位可能已被权威存储推进：唤醒等待者重新对账
+
+    def _signal_waits(self) -> None:
+        """水位可能变化时唤醒全部等待者（O(1)，复制线程绝不阻塞于等待者）。"""
+        with self._wait_cond:
+            self._wait_cond.notify_all()
 
     def _storage_epoch(self) -> int:
         return int(self.store.meta()["epoch"])
@@ -637,6 +664,7 @@ class Replicator:
             "epoch": owner_epoch,
             "state_digest": self._published_digest,
         })
+        self._signal_waits()  # 连续水位已推进：唤醒声明了最低水位的只读等待者
         return {
             "outcome": "confirmed",
             "segment_index": index,
@@ -735,6 +763,271 @@ class Replicator:
                     if r["command_id"] == command_id:
                         return r
         return None
+
+    def plans_view(self) -> dict[str, Any]:
+        with self._lock:
+            self._serve_authoritative_if_lost()
+            return {
+                "confirmed_index": self.confirmed_index,
+                "plans": [
+                    {"id": pid, **pl}
+                    for pid, pl in sorted(self.projection.plans.items())
+                ],
+            }
+
+    # ------------------------------------------------------------------
+    # 只读水位等待（min_watermark / max_wait_ms / request_id 幂等）
+    # ------------------------------------------------------------------
+    #
+    # 只读调用方在状态/草案/命令结果查询上声明最低连续水位与最长等待时间：
+    # 当前接管实例尚未复制到该水位时，请求挂起等待，水位真正达标后返回
+    # 满足条件的同一原子截面；超时返回 504 + 当前权威水位 + 可再次请求的
+    # 信息，绝不把较旧数据伪装成满足条件。等待期间发生接管、缺口隔离、
+    # 暂停或服务重启时，等待记录持久化于权威存储并随之恢复；同一
+    # request_id 再次请求返回原结果。等待者只阻塞各自的 HTTP 线程，
+    # 复制线程不受任何等待者影响。
+
+    def await_watermark(
+        self,
+        *,
+        view: str,
+        min_watermark: int,
+        max_wait_ms: int = 0,
+        request_id: str | None = None,
+        command_id: str | None = None,
+    ) -> tuple[int, dict[str, Any]]:
+        """声明最低连续水位的只读查询，返回 (http_status, body)。
+
+        - 水位已达标：立即捕获同一原子截面返回 200（结果持久化，可幂等重放）；
+        - 未达标：挂起等待至水位达标或截止时刻；
+        - 超时：504 + 当前权威水位 + 重试信息（不含任何截面内容）；
+        - 同一 request_id：返回首次请求的原结果（idempotent_replay=true）。
+        """
+        if view not in ("state", "plans", "commands", "command"):
+            raise ReplicatorError(
+                BAD_WAIT_PARAMS, f"不支持水位等待的视图: {view}", status=400)
+        if view == "command" and not command_id:
+            raise ReplicatorError(
+                BAD_WAIT_PARAMS, "command 视图必须提供 command_id", status=400)
+        if (not isinstance(min_watermark, int) or isinstance(min_watermark, bool)
+                or min_watermark < 0):
+            raise ReplicatorError(
+                BAD_WAIT_PARAMS, "min_watermark 必须是非负整数（连续水位 = 已确认分段数）",
+                status=400)
+        if (not isinstance(max_wait_ms, int) or isinstance(max_wait_ms, bool)
+                or max_wait_ms < 0 or max_wait_ms > MAX_WAIT_MS):
+            raise ReplicatorError(
+                BAD_WAIT_PARAMS,
+                f"max_wait_ms 必须是 0..{MAX_WAIT_MS} 的整数毫秒", status=400)
+        if request_id is not None and (not request_id or len(request_id) > 128):
+            raise ReplicatorError(
+                BAD_WAIT_PARAMS, "request_id 必须是 1..128 字符的字符串", status=400)
+
+        request_id = request_id or f"wait-{uuid.uuid4().hex[:16]}"
+        now = time.time()
+        created = self.store.wait_insert_if_absent({
+            "request_id": request_id,
+            "view": view,
+            "command_id": command_id,
+            "min_watermark": min_watermark,
+            "max_wait_ms": max_wait_ms,
+            "created_at": now,
+            "deadline": now + max_wait_ms / 1000.0,
+        })
+        rec = self.store.wait_get(request_id)
+        if not created:
+            if rec["state"] != "WAITING":
+                # 同一请求标识再次请求：返回原结果，不重新等待、不重新计算
+                return self._wait_response(rec, replay=True)
+            # 既有等待记录：沿用原参数与原截止时间（重试不延长等待）
+            return self._run_wait(rec, replay=True)
+        return self._run_wait(rec, replay=False)
+
+    def _run_wait(self, rec: dict[str, Any], *, replay: bool) -> tuple[int, dict[str, Any]]:
+        """等待循环：只阻塞当前 HTTP 线程；按切片轮询权威存储。
+
+        复制线程提交新分段后 notify_all 立即唤醒；跨进程接管推进的水位
+        最迟一个切片（100ms）后由存储轮询发现。暂停/缺口隔离期间水位
+        停滞，等待自然持续到超时；进程停止时等待者退出，记录保持
+        WAITING，服务恢复后同一 request_id 可继续。
+        """
+        while True:
+            final = self._reconcile_wait(rec, replay=replay)
+            if final is not None:
+                return final
+            if self._shutdown.is_set():
+                raise ReplicatorError(
+                    REPLICA_SHUTDOWN,
+                    "复制器正在停止：等待请求已持久化，服务恢复后可用同一 "
+                    f"request_id={rec['request_id']} 继续",
+                    status=503,
+                    details={"request_id": rec["request_id"]},
+                )
+            remaining = rec["deadline"] - time.time()
+            if remaining <= 0:
+                continue  # 下一轮对账以权威水位收口 TIMEOUT
+            with self._wait_cond:
+                self._wait_cond.wait(timeout=min(remaining, WAIT_SLICE_SECONDS))
+
+    def _reconcile_wait(
+        self, rec: dict[str, Any], *, replay: bool = False
+    ) -> tuple[int, dict[str, Any]] | None:
+        """对一条 WAITING 记录做一次权威水位对账；未决返回 None。
+
+        水位一律以权威存储为准（接管/暂停/缺口隔离/重启后都跟随存储恢复）；
+        只有连续水位真正达到 min_watermark 才成功——内存落后于存储时先从
+        权威水位重建再捕获截面，绝不把较旧数据伪装成满足条件。
+        """
+        fresh = self.store.wait_get(rec["request_id"])
+        if fresh is None:
+            return None
+        if fresh["state"] != "WAITING":
+            return self._wait_response(fresh, replay=True)
+        now = time.time()
+        with self._lock:
+            # 内存落后于权威存储（含本实例已失主/被接替实例接管）时先重建：
+            # 捕获的截面必须真实处于所声称的水位。
+            if (self._ownership_lost
+                    or self._storage_epoch() != self.epoch
+                    or self.confirmed_index != len(self.segments)):
+                self._rebuild_from_authoritative()
+            wm = len(self.segments)
+            contiguous = self._watermark_contiguous_locked()
+            if contiguous and wm >= fresh["min_watermark"]:
+                status, body = self._capture_view_locked(
+                    fresh["view"], fresh.get("command_id"))
+                seq = self.segments[-1]["seq_end"] if self.segments else 0
+                finished = time.time()
+                body["wait"] = {
+                    "request_id": fresh["request_id"],
+                    "state": "SATISFIED",
+                    "view": fresh["view"],
+                    "min_watermark": fresh["min_watermark"],
+                    "satisfied_watermark": wm,
+                    "satisfied_seq": seq,
+                    "waited_ms": max(0, int((finished - fresh["created_at"]) * 1000)),
+                    "deadline": fresh["deadline"],
+                    "idempotent_replay": False,
+                }
+                self.store.wait_finalize_if_waiting(
+                    fresh["request_id"], "SATISFIED", status, body, wm, seq,
+                    now=finished,
+                )
+                return self._wait_response(
+                    self.store.wait_get(fresh["request_id"]), replay=replay)
+            if now >= fresh["deadline"]:
+                meta = self.store.meta()
+                auth_wm = int(meta["confirmed_index"])
+                auth_seq = int(meta["confirmed_seq"])
+                body = {
+                    "error": WAIT_TIMEOUT,
+                    "message": f"等待连续水位 {fresh['min_watermark']} 超时："
+                               f"当前权威水位 {auth_wm}，未达标不返回截面",
+                    "wait": {
+                        "request_id": fresh["request_id"],
+                        "state": "TIMEOUT",
+                        "view": fresh["view"],
+                        "min_watermark": fresh["min_watermark"],
+                        "waited_ms": max(0, int((now - fresh["created_at"]) * 1000)),
+                        "deadline": fresh["deadline"],
+                        "idempotent_replay": False,
+                    },
+                    "authoritative_watermark": {
+                        "confirmed_index": auth_wm,
+                        "confirmed_seq": auth_seq,
+                        "contiguous": contiguous,
+                        "epoch": int(meta["epoch"]),
+                    },
+                    "retry": {
+                        "hint": "水位未达标：可使用新的 request_id 以相同参数再次"
+                                "发起等待；同一 request_id 重试将返回本次原结果",
+                        "min_watermark": fresh["min_watermark"],
+                        "current_watermark": auth_wm,
+                    },
+                }
+                self.store.wait_finalize_if_waiting(
+                    fresh["request_id"], "TIMEOUT", 504, body, auth_wm, auth_seq,
+                    now=now,
+                )
+                return self._wait_response(
+                    self.store.wait_get(fresh["request_id"]), replay=replay)
+        return None
+
+    def _capture_view_locked(
+        self, view: str, command_id: str | None = None
+    ) -> tuple[int, dict[str, Any]]:
+        """在锁内从内存投影捕获同一原子截面（调用前已与权威存储对齐）。
+
+        截面水位字段一律取内存投影实际所处水位，保证响应体自洽：
+        即使另一进程此刻又推进了存储水位，本截面仍是满足条件的完整截面。
+        """
+        wm = len(self.segments)
+        seq = self.segments[-1]["seq_end"] if self.segments else 0
+        if view == "state":
+            body = self.current_state()
+            body["replica"]["confirmed_index"] = wm
+            body["replica"]["confirmed_seq"] = seq
+            return 200, body
+        if view == "plans":
+            body = self.plans_view()
+            body["confirmed_index"] = wm
+            return 200, body
+        if view == "commands":
+            body = self.commands_view()
+            body["confirmed_index"] = wm
+            return 200, body
+        r = self.receipt(command_id)
+        if r is None:
+            return 404, {"error": "NOT_FOUND",
+                         "message": f"已确认截面内无此命令: {command_id}"}
+        return 200, dict(r)
+
+    def _wait_response(
+        self, rec: dict[str, Any], *, replay: bool
+    ) -> tuple[int, dict[str, Any]]:
+        """从持久化记录还原响应：截面内容与原结果逐字节一致，仅重放标记不同。"""
+        body = copy.deepcopy(rec["result"]) if rec["result"] is not None else {}
+        if isinstance(body.get("wait"), dict):
+            body["wait"]["idempotent_replay"] = replay
+        return int(rec["http_status"] or 200), body
+
+    def _watermark_contiguous_locked(self) -> bool:
+        """连续水位：已确认分段序号必须恰好为 1..confirmed_index 无缺口。"""
+        meta = self.store.meta()
+        idx = int(meta["confirmed_index"])
+        return sorted(self.store.segment_digests()) == list(range(1, idx + 1))
+
+    def _recover_waits_on_startup(self) -> None:
+        """重启后统一对账遗留的水位等待（不依赖任何请求触发）。"""
+        for rec in self.store.wait_list_waiting():
+            self._reconcile_wait(rec)
+
+    def waits_view(self, limit: int = 100) -> dict[str, Any]:
+        """运维/页面视图：等待中的最低水位与剩余时间、已收口请求的最终结果。
+
+        列出前先对 WAITING 记录做一次权威水位对账（惰性收口）：达标即
+        SATISFIED、到点即 TIMEOUT，页面看到的始终是跟随权威存储的真实状态。
+        """
+        for rec in self.store.wait_list_waiting():
+            self._reconcile_wait(rec)
+        now = time.time()
+        waits = []
+        for w in self.store.wait_list(limit):
+            entry = {
+                k: w[k]
+                for k in ("request_id", "view", "command_id", "min_watermark",
+                          "max_wait_ms", "state", "http_status", "created_at",
+                          "deadline", "finished_at", "final_watermark", "final_seq")
+            }
+            entry["remaining_ms"] = (
+                max(0, int((w["deadline"] - now) * 1000))
+                if w["state"] == "WAITING" else 0
+            )
+            # 列表不携带完整截面（可能很大），只带 wait 元信息摘要
+            entry["wait"] = (w.get("result") or {}).get("wait") or {}
+            waits.append(entry)
+        return {"now": now, "waits": waits}
+
 
     # ------------------------------------------------------------------
     # 受控切换演练
@@ -1094,6 +1387,7 @@ class Replicator:
                     "max_lag_segments": self.max_lag_segments,
                     "lag_over_limit": lag_segments > self.max_lag_segments,
                     "frozen_by_drill": drill["drill_id"] if drill else None,
+                    "waiting_reads": len(self.store.wait_list_waiting()),
                     "last_error": self.last_error,
                 },
                 "drill": {

@@ -7,6 +7,7 @@ meta                       确认边界、分段大小、进程围栏纪元等�
 segments                   已确认分段原文（内容寻址：序号 + 摘要唯一）
 quarantined                被拒绝/隔离的分段及原因（不污染确认截面）
 drills                     受控切换演练及带任期地址（含锁定截面冻结）
+wait_requests              只读水位等待请求（幂等原结果，跨接管/重启恢复）
 audit_log                  只追加审计轨迹（拉取、隔离、演练、任期失效）
 ========================== ==============================================
 
@@ -84,6 +85,22 @@ CREATE TABLE IF NOT EXISTS audit_log (
     at          REAL NOT NULL,
     kind        TEXT NOT NULL,
     detail_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS wait_requests (
+    request_id      TEXT PRIMARY KEY,
+    view            TEXT NOT NULL,
+    command_id      TEXT,
+    min_watermark   INTEGER NOT NULL,
+    max_wait_ms     INTEGER NOT NULL,
+    state           TEXT NOT NULL,
+    http_status     INTEGER,
+    result_json     TEXT,
+    created_at      REAL NOT NULL,
+    deadline        REAL NOT NULL,
+    finished_at     REAL,
+    final_watermark INTEGER,
+    final_seq       INTEGER
 );
 """
 
@@ -543,6 +560,96 @@ class ReplicaStore:
         d["report"] = json.loads(d["report_json"]) if d["report_json"] else {}
         del d["report_json"]
         return d
+
+    # ------------------------------------------------------------------
+    # wait_requests（只读水位等待：跨接管/重启跟随权威存储，幂等原结果）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _wait_row(r: sqlite3.Row) -> dict[str, Any]:
+        d = dict(r)
+        d["result"] = json.loads(d["result_json"]) if d["result_json"] else None
+        del d["result_json"]
+        return d
+
+    def wait_get(self, request_id: str) -> dict[str, Any] | None:
+        r = self.conn.execute(
+            "SELECT * FROM wait_requests WHERE request_id = ?", (request_id,)
+        ).fetchone()
+        return self._wait_row(r) if r else None
+
+    def wait_insert_if_absent(self, rec: dict[str, Any]) -> bool:
+        """占位创建 WAITING 记录。同 request_id 已存在返回 False（幂等）。"""
+        with self.lock, self.conn:
+            cur = self.conn.execute(
+                "INSERT OR IGNORE INTO wait_requests (request_id, view, command_id,"
+                " min_watermark, max_wait_ms, state, created_at, deadline)"
+                " VALUES (?,?,?,?,?,'WAITING',?,?)",
+                (
+                    rec["request_id"],
+                    rec["view"],
+                    rec.get("command_id"),
+                    rec["min_watermark"],
+                    rec["max_wait_ms"],
+                    rec["created_at"],
+                    rec["deadline"],
+                ),
+            )
+            return cur.rowcount == 1
+
+    def wait_finalize_if_waiting(
+        self,
+        request_id: str,
+        state: str,
+        http_status: int,
+        body: dict[str, Any],
+        final_watermark: int,
+        final_seq: int,
+        now: float | None = None,
+    ) -> bool:
+        """WAITING → 终态（SATISFIED/TIMEOUT）的唯一路径。
+
+        条件更新是跨线程/跨进程的唯一赢家选举：并发同标识请求、乃至两个
+        副本进程同时收口时，只有一个事务能落终态，且终态结果与
+        ``wait_finished`` 审计在**同一事务**提交；输家读取既有终态幂等返回。
+        """
+        now = now if now is not None else time.time()
+        with self.lock, self.conn:
+            cur = self.conn.execute(
+                "UPDATE wait_requests SET state = ?, http_status = ?, result_json = ?,"
+                " finished_at = ?, final_watermark = ?, final_seq = ?"
+                " WHERE request_id = ? AND state = 'WAITING'",
+                (state, http_status, canonical(body), now,
+                 final_watermark, final_seq, request_id),
+            )
+            if cur.rowcount != 1:
+                return False
+            row = self.conn.execute(
+                "SELECT view, min_watermark FROM wait_requests WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+            self.conn.execute(
+                "INSERT INTO audit_log (at, kind, detail_json) VALUES (?,?,?)",
+                (now, "wait_finished",
+                 canonical({"request_id": request_id, "state": state,
+                            "view": row["view"], "min_watermark": row["min_watermark"],
+                            "http_status": http_status,
+                            "final_watermark": final_watermark,
+                            "final_seq": final_seq})),
+            )
+            return True
+
+    def wait_list(self, limit: int = 100) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM wait_requests ORDER BY created_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [self._wait_row(r) for r in rows]
+
+    def wait_list_waiting(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM wait_requests WHERE state = 'WAITING' ORDER BY created_at"
+        ).fetchall()
+        return [self._wait_row(r) for r in rows]
 
     # ------------------------------------------------------------------
     # audit
