@@ -979,5 +979,424 @@ class TestTermRecovery(ReplicaTestBase):
         self.assertTrue(resolved, "缺口恢复后旧隔离必须被消除")
 
 
+# ----------------------------------------------------------------------
+# 7) 水位等待查询（最低连续水位 + 最长等待 + 请求标识幂等）
+# ----------------------------------------------------------------------
+
+class TestWatermarkWait(ReplicaTestBase):
+    def _httpd(self, rep):
+        httpd = create_replica_http("127.0.0.1", self.port + 100, rep)
+        Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.shutdown)
+        return f"http://127.0.0.1:{self.port + 100}"
+
+    @staticmethod
+    def _async_get(url):
+        box = {}
+
+        def run():
+            try:
+                box["r"] = http("GET", url)
+            except Exception as exc:  # noqa: BLE001
+                box["e"] = exc
+
+        t = Thread(target=run, daemon=True)
+        t.start()
+        return t, box
+
+    def test_70_satisfied_immediately_and_zero_wait_timeout(self):
+        seed_business(self.base)
+        rep = self.make_replicator()
+        self.addCleanup(self.stop, rep)
+        wait_until(lambda: rep.confirmed_index >= 1)
+        base_r = self._httpd(rep)
+        cur = rep.confirmed_index
+
+        # 水位已满足：立即返回当前原子截面，不挂起
+        t0 = time.time()
+        code, body = http("GET", f"{base_r}/api/state?min_watermark={cur}")
+        self.assertEqual(code, 200)
+        self.assertLess(time.time() - t0, 2)
+        self.assertTrue(body["wait"]["satisfied"])
+        self.assertGreaterEqual(body["wait"]["watermark"], cur)
+        self.assertIn("nodes", body)
+
+        # 暂停使水位定格，断言超时回显的权威水位是确定值
+        rep.set_paused(True)
+        time.sleep(0.15)
+        cur = rep.confirmed_index
+
+        # 水位未到且不等待（wait_ms=0）：立即 408，绝不返回较旧截面
+        code, body = http(
+            "GET", f"{base_r}/api/state?min_watermark={cur + 9}&wait_ms=0")
+        self.assertEqual(code, 408)
+        self.assertEqual(body["error"], "WAIT_TIMEOUT")
+        self.assertNotIn("nodes", body, "超时不得把较旧数据伪装成满足条件")
+        self.assertEqual(body["details"]["authoritative_watermark"], cur)
+
+        # 参数非法 → 400
+        code, _ = http("GET", f"{base_r}/api/state?min_watermark=abc")
+        self.assertEqual(code, 400)
+
+    def test_71_wait_blocks_until_watermark_then_same_atomic_surface(self):
+        seed_business(self.base)
+        rep = self.make_replicator()
+        self.addCleanup(self.stop, rep)
+        wait_until(lambda: rep.confirmed_index >= 1)
+        base_r = self._httpd(rep)
+
+        rep.set_paused(True)
+        time.sleep(0.15)  # 等在途 poll 落定，水位定格
+        k = rep.confirmed_index
+        bump_capacity_n(self.base, SEGMENT_SIZE, "w71")  # 主站密封 k+1
+        target = k + 1
+        t, box = self._async_get(
+            f"{base_r}/api/state?min_watermark={target}"
+            f"&wait_ms=8000&request_id=w-71")
+        time.sleep(0.5)
+        self.assertTrue(t.is_alive(), "水位未到时请求必须挂起等待")
+
+        # 等待中：运维面可见最低水位与剩余时间
+        waits = http("GET", f"{base_r}/ops/waits")[1]
+        self.assertGreaterEqual(waits["pending_count"], 1)
+        mine = [w for w in waits["waits"] if w["request_id"] == "w-71"]
+        self.assertTrue(mine and mine[0]["outcome"] is None)
+        self.assertEqual(mine[0]["min_watermark"], target)
+        self.assertGreater(mine[0]["remaining_ms"], 0)
+
+        # 恢复复制 → 水位到达 → 等待者被唤醒，拿到满足条件的原子截面
+        rep.set_paused(False)
+        t.join(timeout=8)
+        self.assertFalse(t.is_alive())
+        code, body = box["r"]
+        self.assertEqual(code, 200)
+        self.assertTrue(body["wait"]["satisfied"])
+        first_wm = body["wait"]["watermark"]
+        self.assertGreaterEqual(first_wm, target)
+        self.assertGreater(body["wait"]["waited_ms"], 0)
+        self.assertEqual(
+            body["total_available"] + body["total_consumed"],
+            body["global_capacity"])
+        self.assertEqual(
+            body["replica"]["state_digest"],
+            verifier.state_digest(verifier.replay_all(
+                rep.store.load_segments()[:first_wm])),
+            "返回的必须是权威水位处的同一原子截面")
+
+        # 页面/运维面可见终态结果
+        waits = http("GET", f"{base_r}/ops/waits")[1]
+        mine = [w for w in waits["waits"] if w["request_id"] == "w-71"]
+        self.assertEqual(mine[0]["outcome"], "satisfied")
+        self.assertGreaterEqual(mine[0]["watermark_at_finish"], target)
+
+        # 同一请求标识再请求：返回原结果（即使水位已继续前进）
+        bump_capacity_n(self.base, SEGMENT_SIZE, "w71-more")
+        wait_until(lambda: rep.confirmed_index >= first_wm + 1)
+        code2, body2 = http(
+            "GET", f"{base_r}/api/state?min_watermark={target}"
+                   f"&wait_ms=8000&request_id=w-71")
+        self.assertEqual(code2, 200)
+        self.assertTrue(body2["wait"]["idempotent_replay"])
+        self.assertEqual(body2["wait"]["watermark"], first_wm,
+                         "同标识再请求必须返回首次的原结果，而非最新水位")
+
+    def test_72_timeout_returns_authoritative_watermark_and_retry(self):
+        seed_business(self.base)
+        rep = self.make_replicator()
+        self.addCleanup(self.stop, rep)
+        wait_until(lambda: rep.confirmed_index >= 1)
+        base_r = self._httpd(rep)
+        rep.set_paused(True)
+        time.sleep(0.15)  # 定格水位，超时回显的权威水位才是确定值
+        cur = rep.confirmed_index
+
+        t0 = time.time()
+        code, body = http(
+            "GET", f"{base_r}/api/state?min_watermark={cur + 50}"
+                   f"&wait_ms=400&request_id=w-72")
+        self.assertGreaterEqual(time.time() - t0, 0.35)
+        self.assertEqual(code, 408)
+        self.assertEqual(body["error"], "WAIT_TIMEOUT")
+        d = body["details"]
+        self.assertEqual(d["authoritative_watermark"], cur)
+        self.assertEqual(d["min_watermark"], cur + 50)
+        self.assertTrue(d["watermark_contiguous"])
+        self.assertIn("retry", d)
+        self.assertIn("request_id=w-72", d["retry"]["url"])
+        self.assertNotIn("nodes", body)
+
+        # 同一标识再请求：返回同一份超时原结果（不重新等待）
+        t0 = time.time()
+        code2, body2 = http(
+            "GET", f"{base_r}/api/state?min_watermark={cur + 50}"
+                   f"&wait_ms=400&request_id=w-72")
+        self.assertLess(time.time() - t0, 2)
+        self.assertEqual(code2, 408)
+        self.assertTrue(body2["details"]["idempotent_replay"])
+        self.assertEqual(body2["details"]["authoritative_watermark"], cur)
+
+        # 同一标识换参数 → 409 冲突
+        code3, body3 = http(
+            "GET", f"{base_r}/api/state?min_watermark={cur + 51}"
+                   f"&wait_ms=400&request_id=w-72")
+        self.assertEqual(code3, 409)
+        self.assertEqual(body3["error"], "WAIT_REQUEST_CONFLICT")
+
+    def test_73_wait_on_plans_commands_and_single_command(self):
+        seed_business(self.base)
+        rep = self.make_replicator()
+        self.addCleanup(self.stop, rep)
+        sealed = 0
+        wait_until(lambda: rep.confirmed_index >= 1)
+        sealed = rep._fetch_primary_status()["sealed_index"]  # noqa: SLF001
+        wait_until(lambda: rep.confirmed_index >= sealed)
+        base_r = self._httpd(rep)
+
+        rep.set_paused(True)
+        k = rep.confirmed_index
+        bump_capacity_n(self.base, SEGMENT_SIZE, "w73")
+        t1, box1 = self._async_get(
+            f"{base_r}/api/plans?min_watermark={k + 1}&wait_ms=8000")
+        t2, box2 = self._async_get(
+            f"{base_r}/api/commands?min_watermark={k + 1}&wait_ms=8000")
+        time.sleep(0.4)
+        self.assertTrue(t1.is_alive() and t2.is_alive())
+        rep.set_paused(False)
+        t1.join(timeout=8)
+        t2.join(timeout=8)
+        code, body = box1["r"]
+        self.assertEqual(code, 200)
+        self.assertIn("plans", body)
+        self.assertGreaterEqual(body["wait"]["watermark"], k + 1)
+        code, body = box2["r"]
+        self.assertEqual(code, 200)
+        self.assertIn("commands", body)
+        self.assertGreaterEqual(body["wait"]["watermark"], k + 1)
+
+        # 单条命令结果：水位满足后查到回执；不存在的命令在水位到达后 404
+        code, body = http(
+            "GET", f"{base_r}/api/commands/usage-0?min_watermark={k}&wait_ms=100")
+        self.assertEqual(code, 200)
+        self.assertEqual(body["result"]["command"], "usage")
+        code, body = http(
+            "GET", f"{base_r}/api/commands/nope?min_watermark={k}&wait_ms=100")
+        self.assertEqual(code, 404)
+
+    def test_74_wait_follows_takeover_across_instances(self):
+        """等待期间发生接管：旧实例上挂起的等待跟随权威存储恢复，
+        接替实例推进连续水位后，旧实例的等待者按权威水位成功。"""
+        seed_business(self.base, rounds=SEGMENT_SIZE * 2)
+        old = self.make_replicator()
+        self.addCleanup(self.stop, old)
+        wait_until(lambda: old.confirmed_index >= 1)
+        old.set_paused(True)
+        time.sleep(0.15)  # 等在途 poll 落定，k 之后的段只能由接替实例确认
+        k = old.confirmed_index
+
+        # 接替实例：提升纪元取得写入所有权（不启动后台循环）
+        store_b = ReplicaStore(self.replica_db, segment_size=SEGMENT_SIZE)
+        new = Replicator(store_b, primary_url=self.base,
+                         max_lag_segments=500, poll_interval=0.03)
+        self.addCleanup(self.stop, new)
+        new.epoch = store_b.bump_epoch()
+        new._rebuild_from_authoritative()  # noqa: SLF001
+
+        # 旧实例上挂起一个等待 K+1 的请求
+        box = {}
+
+        def waiter():
+            try:
+                box["r"] = old.wait_for_watermark(
+                    "state", k + 1, 10_000, request_id="w-takeover")
+            except Exception as exc:  # noqa: BLE001
+                box["e"] = exc
+
+        t = Thread(target=waiter, daemon=True)
+        t.start()
+        time.sleep(0.3)
+        self.assertTrue(t.is_alive())
+
+        # 接替实例确认 K+1：权威水位前进，旧实例失去所有权
+        env_k1 = new._fetch_segment(k + 1)  # noqa: SLF001
+        self.assertEqual(new.ingest(env_k1, source="poll")["outcome"], "confirmed")
+
+        # 旧实例的等待者跟随权威存储恢复：水位真正到达后成功
+        t.join(timeout=8)
+        self.assertFalse(t.is_alive())
+        code, body = box["r"]
+        self.assertEqual(code, 200)
+        self.assertTrue(body["wait"]["satisfied"])
+        self.assertEqual(body["wait"]["watermark"], k + 1)
+        disk = verifier.state_digest(verifier.replay_all(old.store.load_segments()))
+        self.assertEqual(body["replica"]["state_digest"], disk,
+                         "等待结果必须是权威水位截面，不是旧实例漏批的内存")
+
+    def test_75_pending_wait_resumes_after_restart(self):
+        """等待期间服务重启：待决请求持久化，接替进程按权威存储继续等待，
+        连续水位真正到达后同标识再请求才成功。"""
+        seed_business(self.base)
+        rep = self.make_replicator()
+        wait_until(lambda: rep.confirmed_index >= 1)
+        rep.set_paused(True)
+        time.sleep(0.15)  # 定格水位：k+1 只能由重启后的实例复制到达
+        k = rep.confirmed_index
+        box = {}
+
+        def waiter():
+            try:
+                box["r"] = rep.wait_for_watermark(
+                    "state", k + 1, 60_000, request_id="w-restart")
+            except Exception as exc:  # noqa: BLE001
+                box["e"] = exc
+
+        t = Thread(target=waiter, daemon=True)
+        t.start()
+        time.sleep(0.3)
+        self.assertTrue(t.is_alive())
+        # 服务重启：在途请求随进程消失，但等待记录已持久化
+        self.stop(rep)
+
+        store2 = ReplicaStore(self.replica_db, segment_size=SEGMENT_SIZE)
+        rep2 = Replicator(store2, primary_url=self.base, poll_interval=0.03)
+        rep2.start()
+        self.addCleanup(self.stop, rep2)
+        # 待决等待在重启后仍待决（运维面可见），不会被伪装成已满足
+        pend = [w for w in rep2.list_waits()["waits"] if w["outcome"] is None]
+        self.assertTrue(any(w["request_id"] == "w-restart" for w in pend))
+
+        # 恢复复制（暂停标志随库持久化）：主站推进 → 新实例复制到 K+1
+        rep2.set_paused(False)
+        bump_capacity_n(self.base, SEGMENT_SIZE, "w-restart")
+        wait_until(lambda: rep2.confirmed_index >= k + 1)
+        code, body = rep2.wait_for_watermark(
+            "state", k + 1, 60_000, request_id="w-restart")
+        self.assertEqual(code, 200)
+        self.assertTrue(body["wait"]["satisfied"])
+        self.assertGreaterEqual(body["wait"]["watermark"], k + 1)
+        # 再请求：返回首次收口的原结果
+        code2, body2 = rep2.wait_for_watermark(
+            "state", k + 1, 60_000, request_id="w-restart")
+        self.assertEqual(code2, 200)
+        self.assertTrue(body2["wait"]["idempotent_replay"])
+
+    def test_76_wait_expired_during_downtime_finalized_on_restart(self):
+        """截止时刻在停机期间到达：重启后等待记录被收口为超时终态，
+        同标识再请求返回该原结果（如实回显权威水位）。"""
+        seed_business(self.base)
+        rep = self.make_replicator()
+        wait_until(lambda: rep.confirmed_index >= 1)
+        rep.set_paused(True)
+        time.sleep(0.15)  # 定格水位（暂停标志随库持久化，重启后仍暂停）
+        k = rep.confirmed_index
+        box = {}
+
+        def waiter():
+            try:
+                box["r"] = rep.wait_for_watermark(
+                    "plans", k + 5, 400, request_id="w-down")
+            except Exception as exc:  # noqa: BLE001
+                box["e"] = exc
+
+        t = Thread(target=waiter, daemon=True)
+        t.start()
+        time.sleep(0.15)
+        self.stop(rep)  # 停机时请求仍在等待，截止时刻在停机期间到达
+        t.join(timeout=4)
+
+        store2 = ReplicaStore(self.replica_db, segment_size=SEGMENT_SIZE)
+        rep2 = Replicator(store2, primary_url=self.base, poll_interval=0.03)
+        rep2.start()
+        self.addCleanup(self.stop, rep2)
+        wait_until(lambda: rep2.store.wait_get("w-down")["outcome"] is not None)
+        row = rep2.store.wait_get("w-down")
+        self.assertEqual(row["outcome"], "timeout")
+        # 同标识再请求：返回原超时结果，权威水位如实回显，不伪装满足
+        code, body = rep2.wait_for_watermark(
+            "plans", k + 5, 400, request_id="w-down")
+        self.assertEqual(code, 408)
+        self.assertTrue(body["details"]["idempotent_replay"])
+        self.assertEqual(body["details"]["authoritative_watermark"], k)
+        self.assertNotIn("plans", body)
+
+    def test_77_many_waiters_do_not_block_replication(self):
+        """多个等待者挂在未来水位上时，复制线程照常推进，最终全部满足。"""
+        seed_business(self.base, rounds=SEGMENT_SIZE * 2)
+        rep = self.make_replicator()
+        self.addCleanup(self.stop, rep)
+        wait_until(lambda: rep.confirmed_index >= 1)
+        rep.set_paused(True)
+        k = rep.confirmed_index
+        bump_capacity_n(self.base, SEGMENT_SIZE * 2, "w-many")
+
+        boxes, threads = [], []
+        for i in range(6):
+            box = {}
+
+            def waiter(b=box, n=i):
+                try:
+                    b["r"] = rep.wait_for_watermark(
+                        "commands", k + 2, 15_000, request_id=f"w-many-{n}")
+                except Exception as exc:  # noqa: BLE001
+                    b["e"] = exc
+
+            t = Thread(target=waiter, daemon=True)
+            t.start()
+            threads.append(t)
+            boxes.append(box)
+        time.sleep(0.4)
+        self.assertTrue(all(t.is_alive() for t in threads))
+
+        # 复制线程不被等待者拖住：恢复后水位连续推进两段
+        rep.set_paused(False)
+        wait_until(lambda: rep.confirmed_index >= k + 2, timeout=8)
+        for t in threads:
+            t.join(timeout=8)
+        self.assertTrue(all(not t.is_alive() for t in threads))
+        for b in boxes:
+            code, body = b["r"]
+            self.assertEqual(code, 200)
+            self.assertGreaterEqual(body["wait"]["watermark"], k + 2)
+
+    def test_78_pause_and_gap_during_wait_stay_honest(self):
+        """暂停 / 缺口隔离期间等待：水位不动则超时如实返回；恢复后新等待成功。"""
+        seed_business(self.base, rounds=SEGMENT_SIZE * 2)
+        rep = self.make_replicator()
+        self.addCleanup(self.stop, rep)
+        wait_until(lambda: rep.confirmed_index >= 1)
+        rep.set_paused(True)
+        time.sleep(0.15)  # 定格水位
+        k = rep.confirmed_index
+
+        # 暂停期间等待：主站已密封 k+1 但复制暂停 → 超时且如实标注 paused
+        bump_capacity_n(self.base, SEGMENT_SIZE, "w-pause")
+        t0 = time.time()
+        code, body = rep.wait_for_watermark(
+            "state", k + 1, 500, request_id="w-paused")
+        self.assertGreaterEqual(time.time() - t0, 0.4)
+        self.assertEqual(code, 408)
+        self.assertTrue(body["details"]["paused"])
+        self.assertEqual(body["details"]["authoritative_watermark"], k)
+
+        # 缺口隔离期间等待：缺口未补齐水位不动 → 超时
+        self.set_chaos("gap", k + 1)
+        rep.set_paused(False)
+        wait_until(lambda: any(
+            q["reason"] == verifier.SEGMENT_INDEX_MISMATCH
+            for q in rep.store.list_quarantined()))
+        self.assertEqual(rep.confirmed_index, k)
+        code, body = rep.wait_for_watermark(
+            "state", k + 1, 500, request_id="w-gap")
+        self.assertEqual(code, 408)
+        self.assertEqual(body["details"]["authoritative_watermark"], k)
+
+        # 缺口恢复：连续水位真正到达后，新等待成功
+        self.set_chaos(None)
+        wait_until(lambda: rep.confirmed_index >= k + 1, timeout=8)
+        code, body = rep.wait_for_watermark(
+            "state", k + 1, 5000, request_id="w-gap-ok")
+        self.assertEqual(code, 200)
+        self.assertTrue(body["wait"]["satisfied"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

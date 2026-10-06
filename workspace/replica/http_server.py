@@ -10,9 +10,16 @@
   GET  /term/{token}/state        带任期地址：锁定截面（演练发放）
   GET  /term/{token}/commands     带任期地址：锁定时的命令结果
 
+以上四个 /api 查询都可声明最低连续水位与最长等待：
+  ?min_watermark=N&wait_ms=M&request_id=R
+  水位未到则挂起等待（仅阻塞本请求线程），水位真正到达后返回满足条件的
+  同一原子截面；超时返回 408 与当前权威水位/重试信息；request_id 相同的
+  再请求返回原结果（幂等）。
+
 运维 / 演练接口：
 
-  GET  /ops/status                复制进度、延迟、隔离、当前演练
+  GET  /ops/status                复制进度、延迟、隔离、当前演练、等待中请求
+  GET  /ops/waits                 水位等待请求（等待中：最低水位/剩余时间；终态：结果）
   GET  /ops/quarantine            隔离记录（含已消除）
   GET  /ops/audit                 全量一致性审计
   GET  /ops/audit-tail            审计轨迹尾部
@@ -30,7 +37,7 @@ from __future__ import annotations
 import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from .replicator import ReplicatorError
 
@@ -75,25 +82,50 @@ class ReplicaHandler(BaseHTTPRequestHandler):
     # 只读查询面
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _wait_params(query: dict[str, list[str]]) -> tuple[int, int, str | None] | None:
+        """解析水位等待参数；未声明 min_watermark 时返回 None（普通查询）。"""
+        raw_wm = query.get("min_watermark", [None])[0]
+        if raw_wm is None:
+            return None
+        try:
+            min_watermark = int(raw_wm)
+            wait_ms = int(query.get("wait_ms", ["0"])[0])
+        except (TypeError, ValueError):
+            raise ReplicatorError(
+                "BAD_WAIT_PARAMS",
+                "min_watermark / wait_ms 必须是整数", status=400)
+        request_id = query.get("request_id", [None])[0] or None
+        return min_watermark, wait_ms, request_id
+
     def do_GET(self) -> None:  # noqa: N802
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
+        query = parse_qs(parsed.query)
         rep = self._rep()
         try:
+            wait = self._wait_params(query)
             if path == "/api/state":
+                if wait is not None:
+                    code, body = rep.wait_for_watermark("state", *wait)
+                    return self._json(code, body)
                 return self._json(200, rep.current_state())
             if path == "/api/plans":
-                state = rep.current_state()
-                return self._json(200, {
-                    "confirmed_index": state["replica"]["confirmed_index"],
-                    "plans": [
-                        {"id": pid, **pl}
-                        for pid, pl in sorted(rep.projection.plans.items())
-                    ],
-                })
+                if wait is not None:
+                    code, body = rep.wait_for_watermark("plans", *wait)
+                    return self._json(code, body)
+                return self._json(200, rep.plans_view())
             if path == "/api/commands":
+                if wait is not None:
+                    code, body = rep.wait_for_watermark("commands", *wait)
+                    return self._json(code, body)
                 return self._json(200, rep.commands_view())
             if path.startswith("/api/commands/"):
                 cid = path[len("/api/commands/"):].strip("/")
+                if wait is not None:
+                    code, body = rep.wait_for_watermark("command", *wait,
+                                                        command_id=cid)
+                    return self._json(code, body)
                 r = rep.receipt(cid)
                 if r is None:
                     return self._json(404, {"error": "NOT_FOUND",
@@ -117,6 +149,8 @@ class ReplicaHandler(BaseHTTPRequestHandler):
             # ---- 运维面 ----
             if path == "/ops/status":
                 return self._json(200, rep.status())
+            if path == "/ops/waits":
+                return self._json(200, rep.list_waits())
             if path == "/ops/quarantine":
                 return self._json(200, {"records": rep.store.list_quarantined(True)})
             if path == "/ops/audit":

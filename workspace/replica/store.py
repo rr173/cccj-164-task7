@@ -85,6 +85,21 @@ CREATE TABLE IF NOT EXISTS audit_log (
     kind        TEXT NOT NULL,
     detail_json TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS wait_requests (
+    request_id          TEXT PRIMARY KEY,
+    view                TEXT NOT NULL,
+    command_id          TEXT,
+    min_watermark       INTEGER NOT NULL,
+    wait_ms             INTEGER NOT NULL,
+    deadline_at         REAL NOT NULL,
+    created_at          REAL NOT NULL,
+    finished_at         REAL,
+    outcome             TEXT,
+    http_status         INTEGER,
+    result_json         TEXT,
+    watermark_at_finish INTEGER
+);
 """
 
 GENESIS_HASH = "0" * 64
@@ -543,6 +558,92 @@ class ReplicaStore:
         d["report"] = json.loads(d["report_json"]) if d["report_json"] else {}
         del d["report_json"]
         return d
+
+    # ------------------------------------------------------------------
+    # wait_requests（水位等待请求：幂等 + 跨重启恢复）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _wait_row(r: sqlite3.Row) -> dict[str, Any]:
+        d = dict(r)
+        d["result"] = json.loads(d["result_json"]) if d["result_json"] else None
+        del d["result_json"]
+        return d
+
+    def wait_get(self, request_id: str) -> dict[str, Any] | None:
+        r = self.conn.execute(
+            "SELECT * FROM wait_requests WHERE request_id = ?", (request_id,)
+        ).fetchone()
+        return self._wait_row(r) if r else None
+
+    def wait_begin(self, record: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        """登记一条待决等待请求（幂等）。
+
+        同一 ``request_id`` 并发登记时只有第一个插入生效，后到的 adopt 既有行
+        （等待参数以首次登记为准）。返回 ``(行, 是否本次新建)``。
+        """
+        with self.lock, self.conn:
+            cur = self.conn.execute(
+                "INSERT OR IGNORE INTO wait_requests"
+                " (request_id, view, command_id, min_watermark, wait_ms,"
+                "  deadline_at, created_at)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (
+                    record["request_id"],
+                    record["view"],
+                    record.get("command_id"),
+                    record["min_watermark"],
+                    record["wait_ms"],
+                    record["deadline_at"],
+                    record["created_at"],
+                ),
+            )
+            created = cur.rowcount == 1
+        return self.wait_get(record["request_id"]), created
+
+    def wait_finish_if_pending(
+        self,
+        request_id: str,
+        outcome: str,
+        http_status: int,
+        result: dict[str, Any],
+        watermark_at_finish: int,
+        now: float | None = None,
+    ) -> bool:
+        """把待决等待请求原子收口为终态结果（唯一赢家选举）。
+
+        等待线程、超时 sweeper、同标识并发请求同时收口时，条件更新
+        （``outcome IS NULL``）保证只有一个事务落终态；输家必须读取并返回
+        既有结果，绝不覆盖。
+        """
+        now = now if now is not None else time.time()
+        with self.lock, self.conn:
+            cur = self.conn.execute(
+                "UPDATE wait_requests SET outcome = ?, http_status = ?,"
+                " result_json = ?, watermark_at_finish = ?, finished_at = ?"
+                " WHERE request_id = ? AND outcome IS NULL",
+                (outcome, http_status, canonical(result), watermark_at_finish,
+                 now, request_id),
+            )
+            return cur.rowcount == 1
+
+    def list_pending_waits(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM wait_requests WHERE outcome IS NULL"
+            " ORDER BY created_at"
+        ).fetchall()
+        return [self._wait_row(r) for r in rows]
+
+    def list_waits(self, limit: int = 50) -> list[dict[str, Any]]:
+        """等待中的请求在前（按创建时间），其后是最近完成的终态结果。"""
+        rows = self.conn.execute(
+            "SELECT * FROM wait_requests"
+            " ORDER BY (outcome IS NULL) DESC,"
+            "          COALESCE(finished_at, created_at) DESC"
+            " LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [self._wait_row(r) for r in rows]
 
     # ------------------------------------------------------------------
     # audit

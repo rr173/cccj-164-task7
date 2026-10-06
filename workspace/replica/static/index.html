@@ -83,6 +83,16 @@
     <div id="term-result"></div>
   </div>
 
+  <!-- 水位等待 -->
+  <div class="card full">
+    <h2>水位等待（只读查询的最低连续水位订阅）</h2>
+    <div id="waits-sum" class="muted"></div>
+    <table id="waits-table"><thead><tr>
+      <th>请求标识</th><th>视图</th><th class="num">最低水位</th>
+      <th class="num">剩余时间</th><th>状态</th><th class="num">完成水位</th><th>最终结果</th>
+    </tr></thead><tbody></tbody></table>
+  </div>
+
   <!-- 隔离 -->
   <div class="card full">
     <h2>隔离记录（不污染最近可用截面）</h2>
@@ -309,6 +319,34 @@ async function loadDrills() {
       </tr>`).join('');
 }
 
+async function loadWaits() {
+  const data = await api('/ops/waits');
+  const rows = data.waits;
+  $('waits-sum').textContent = data.pending_count > 0
+    ? `等待中 ${data.pending_count} 个：连续水位未到声明的最低水位，请求挂起中`
+    : '当前无等待中的水位请求';
+  $('waits-table').querySelector('tbody').innerHTML = rows.length === 0
+    ? '<tr><td colspan="7" class="muted">暂无水位等待请求（查询可带 min_watermark & wait_ms & request_id）</td></tr>'
+    : rows.map(w => {
+      const pending = w.outcome === null;
+      const remain = pending ? Math.max(0, w.deadline_at - Date.now()/1000) : 0;
+      const result = pending ? ''
+        : w.outcome === 'satisfied'
+          ? `<details><summary class="ok">满足 · 截面</summary><pre>${esc(JSON.stringify(w.result && w.result.wait ? w.result.wait : w.result, null, 1)).slice(0, 600)}</pre></details>`
+          : `<details><summary class="bad">超时 · 权威水位 ${w.result?.details?.authoritative_watermark ?? '?'}</summary><pre>${esc(JSON.stringify(w.result?.details?.retry ?? {}, null, 1))}</pre></details>`;
+      return `<tr>
+        <td>${esc(short(w.request_id, 22))}</td>
+        <td>${esc(w.view)}</td>
+        <td class="num">${w.min_watermark}</td>
+        <td class="num">${pending ? '<span class="warn">' + remain.toFixed(1) + 's</span>' : '—'}</td>
+        <td>${pending ? pill('等待中','warn')
+          : w.outcome === 'satisfied' ? pill('已满足','ok') : pill('已超时','bad')}</td>
+        <td class="num">${w.watermark_at_finish ?? '—'}</td>
+        <td>${result}</td>
+      </tr>`;
+    }).join('');
+}
+
 async function loadAuditTail() {
   const {entries} = await api('/ops/audit-tail');
   $('audit-tail').textContent = entries.map(e =>
@@ -354,7 +392,7 @@ async function runAudit() {
 
 async function loadAll() {
   try {
-    await Promise.all([loadStatus(), loadSurface(), loadPlansAndCommands(), loadDrills()]);
+    await Promise.all([loadStatus(), loadSurface(), loadPlansAndCommands(), loadDrills(), loadWaits()]);
     await loadAuditTail();
   } catch (e) { /* 页面保持上次数据 */ }
   $('h-clock').textContent = new Date().toLocaleTimeString('zh-CN', {hour12:false});

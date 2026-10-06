@@ -44,7 +44,7 @@ open http://localhost:8899/
 bash demo_replica.sh
 ```
 
-测试：主站 220 项 + 灾备 32 项端到端（真实 HTTP 双进程 + 真实持久化）：
+测试：主站 220 项 + 灾备 41 项端到端（真实 HTTP 双进程 + 真实持久化）：
 
 ```bash
 python3 test_service.py
@@ -178,16 +178,51 @@ CAS（`meta.epoch` 必须仍等于本实例持有的纪元、且边界恰好停�
 磁盘重算值与查询结果不同」的窗口被彻底关闭：磁盘重算值始终等于查询
 截面（`replay_equivalence`）。
 
+## 水位等待查询（最低连续水位订阅）
+
+只读调用方可以在 **状态 / 草案 / 命令结果** 查询上声明最低连续水位与最长
+等待时间（查询参数 `min_watermark` / `wait_ms` / `request_id`）：
+
+```bash
+GET /api/state?min_watermark=12&wait_ms=30000&request_id=req-7
+GET /api/plans?min_watermark=12&wait_ms=30000
+GET /api/commands?min_watermark=12&wait_ms=30000
+GET /api/commands/{command_id}?min_watermark=12&wait_ms=30000
+```
+
+- **水位未到 → 挂起等待**：当前权威连续水位低于 `min_watermark` 时请求
+  挂起（只阻塞本 HTTP 线程，复制线程只负责唤醒，绝不被等待者拖住）；
+  连续水位真正到达后返回**满足条件的同一原子截面**（响应带 `wait`
+  块：实际水位、等待时长、`satisfied: true`）；
+- **超时 → 408 如实回显**：返回当前权威水位、连续性、暂停/失主状态与
+  `retry` 重试信息，**绝不把较旧截面伪装成满足条件**（响应里没有任何
+  截面数据）；`wait_ms=0` 等价于“不等待，立即判定”；
+- **等待期间跟随权威存储**：等待循环周期性回读存储中的权威水位
+  （`meta.confirmed_index` + 序号 1..N 连续校验），因此等待期间发生
+  **接管**（接替实例在另一进程推进水位）、**缺口隔离**、**人工暂停**时，
+  等待者始终按权威存储恢复判定——缺口/暂停期间水位不动就诚实超时，
+  接管方推进水位后旧实例上的等待者照样成功；
+- **重启恢复**：待决等待持久化在 `wait_requests` 表。进程重启后在途
+  HTTP 连接虽断开，但同 `request_id` 再请求会按首次登记的截止时刻继续
+  等待；停机期间已过截止时刻的等待由启动 sweep 主动收口（水位已真正
+  到达则按满足收口，否则按当前权威水位收口为超时）；
+- **幂等**：`request_id` 是幂等键，等待参数以首次登记为准，终态结果
+  （满足截面 / 超时回执）落盘。同一标识再请求返回**原结果**
+  （`idempotent_replay: true`），换参数使用同一标识返回
+  `409 WAIT_REQUEST_CONFLICT`；
+- **可观测**：`GET /ops/waits` 与运维页面展示等待中的最低水位、剩余
+  时间与最终结果；`wait_started` / `wait_finished` 进审计轨迹。
+
 ## HTTP API
 
 只读查询面：
 
 | 方法/路径 | 说明 |
 |---|---|
-| `GET /api/state` | 最近确认截面（节点余额/租约/草案视图 + 截面摘要） |
-| `GET /api/plans` | 确认截面内容量草案 |
-| `GET /api/commands` | 已确认命令回执列表 |
-| `GET /api/commands/{command_id}` | 单条命令结果 |
+| `GET /api/state` | 最近确认截面（节点余额/租约/草案视图 + 截面摘要）；支持水位等待参数 |
+| `GET /api/plans` | 确认截面内容量草案；支持水位等待参数 |
+| `GET /api/commands` | 已确认命令回执列表；支持水位等待参数 |
+| `GET /api/commands/{command_id}` | 单条命令结果；支持水位等待参数 |
 | `GET /api/segments` | 已确认分段（序号/seq/摘要） |
 | `GET /term/{token}/state` | 任期：锁定截面 |
 | `GET /term/{token}/commands` | 任期：锁定时命令结果 |
@@ -197,7 +232,8 @@ CAS（`meta.epoch` 必须仍等于本实例持有的纪元、且边界恰好停�
 
 | 方法/路径 | 说明 |
 |---|---|
-| `GET /ops/status` | 进度、主站 tip、延迟、是否落后超限、冻结演练、最后错误 |
+| `GET /ops/status` | 进度、主站 tip、延迟、是否落后超限、冻结演练、等待中请求、最后错误 |
+| `GET /ops/waits` | 水位等待请求（等待中：最低水位/剩余时间；终态：满足截面/超时回执） |
 | `GET /ops/quarantine` | 隔离记录（含原因、来源、是否已消除） |
 | `GET /ops/audit` | 在线全量一致性审计 |
 | `GET /ops/audit-tail` | 审计轨迹尾部 |
@@ -233,7 +269,8 @@ python3 -m replica audit-tail --db ./dr/replica.db --kind segment_quarantined
 | `segments` | 已确认分段原文（序号主键、digest 唯一）及确认它的接管纪元 —— 崩溃恢复的事实来源 |
 | `quarantined` | 被拒/隔离记录、原因码、来源、检测/消除时间 |
 | `drills` | 演练状态机、任期 token/到期时间、锁定摘要、冻结截面、报告 |
-| `audit_log` | 只追加审计轨迹（启动、分段确认、隔离、演练全生命周期等） |
+| `wait_requests` | 水位等待请求：视图/最低水位/截止时刻、终态结果（满足截面或超时回执）—— 幂等与跨重启恢复的事实来源 |
+| `audit_log` | 只追加审计轨迹（启动、分段确认、隔离、演练全生命周期、等待收口等） |
 
 ## 代码结构
 
@@ -242,9 +279,9 @@ python3 -m replica audit-tail --db ./dr/replica.db --kind segment_quarantined
 | `quota/feed.py` | 主站只读馈源：密封分段构造、双层摘要、故障注入（新增） |
 | `quota/http_server.py` | 挂载 `/replica/*` 路由与 CLI 参数（仅新增，未改既有行为） |
 | `replica/verifier.py` | 纯函数校验：信封/双哈希链/投影守恒/命令结果/全量重放 |
-| `replica/store.py` | SQLite 持久化：边界与分段同事务原子提交 |
-| `replica/replicator.py` | 拉取循环、分段准入、原子截面、演练状态机、任期围栏 |
-| `replica/http_server.py` | 只读查询面、任期地址、运维/演练接口、测试注入口 |
+| `replica/store.py` | SQLite 持久化：边界与分段同事务原子提交、等待请求幂等收口 |
+| `replica/replicator.py` | 拉取循环、分段准入、原子截面、演练状态机、任期围栏、水位等待编排 |
+| `replica/http_server.py` | 只读查询面（含水位等待参数）、任期地址、运维/演练接口、测试注入口 |
 | `replica/__main__.py` | `serve` / `audit` / `audit-tail` 命令行 |
-| `replica/static/index.html` | 运维页面（进度/延迟/隔离/截面/演练/审计） |
-| `test_replica.py` | 32 项端到端测试（含到期主动收口、并发收口、重启恢复、异常批次不跳过与滚动升级写入所有权围栏） |
+| `replica/static/index.html` | 运维页面（进度/延迟/水位等待/隔离/截面/演练/审计） |
+| `test_replica.py` | 41 项端到端测试（含到期主动收口、并发收口、重启恢复、异常批次不跳过、滚动升级写入所有权围栏与水位等待全流程） |
